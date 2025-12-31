@@ -1,4 +1,8 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use chrono::{Local};
+use std::thread;
+use std::time::Duration;
 // 用于处理文件路径
 use windows::{
     core::*,
@@ -6,13 +10,18 @@ use windows::{
     Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
     Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, 
-        TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT
+        GetClassNameW, TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
+        GetForegroundWindow,
     },
     // 引入进程线程相关的 API
     Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32
     },
 };
+
+// 定义一个全局变量存储上一次的 HWND
+// HWND 在底层就是一个 isize (指针地址)
+static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
 
 // -----------------------------------------------------------------------------
 // 新增：获取进程名称的辅助函数
@@ -84,7 +93,7 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
-unsafe fn handle_foreground_change(hwnd: HWND) {
+unsafe fn print_wnd_info(hwnd: HWND) {
     // 获取窗口标题
     let mut buffer = [0u16; 512];
     let len = unsafe {
@@ -96,6 +105,17 @@ unsafe fn handle_foreground_change(hwnd: HWND) {
         String::from("No Title")
     };
 
+    // 2. >>> 新增：获取窗口类名 <<<
+    let mut class_buf = [0u16; 512];
+    let class_len = unsafe {
+        GetClassNameW(hwnd, &mut class_buf)    
+    };
+    let class_name = if class_len > 0 {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    } else {
+        String::from("Unknown")
+    };
+
     // 获取进程 ID
     let mut process_id = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)); }
@@ -105,12 +125,56 @@ unsafe fn handle_foreground_change(hwnd: HWND) {
         get_process_name(process_id)
     };
 
-    println!("--------------------------------------------------");
+    let local_now = Local::now();
+    let formatted = local_now.format("%Y-%m-%d %H:%M:%S").to_string();
+    println!("--------------------------{}------------------------", formatted);
     println!("检测到窗口切换!");
     println!("程序名称: {}", process_name); // 例如: chrome.exe
     println!("窗口标题: {}", title);
+    println!("窗口类名: {}", class_name);
     println!("进程 ID : {}", process_id);
     println!("句柄    : {:?}", hwnd);
+}
+
+unsafe fn handle_foreground_change(hwnd: HWND) {
+
+    // ---------------------------------------------------------------
+    // 步骤 1: 瞬态过滤 (防抖)
+    // ---------------------------------------------------------------
+    // 收到事件后，先休眠 50ms，让 Windows 完成窗口动画和焦点切换的中间状态
+    thread::sleep(Duration::from_millis(50));
+
+    // 再次获取当前真正的“前台窗口”
+    let real_foreground_hwnd = unsafe {
+        GetForegroundWindow()    
+    };
+
+    // 如果事件通知的窗口 (hwnd) 已经不再是前台窗口了 (real_foreground_hwnd)
+    // 说明这是一个瞬态事件（例如点击最小化按钮时产生的那个瞬间激活信号）
+    // 直接丢弃，不处理
+    if hwnd != real_foreground_hwnd {
+        println!("++++++++++++++++++++++++过滤瞬态窗口++++++++++++++++++++++++");
+        println!("--------------------------上报窗口--------------------------");
+        unsafe { print_wnd_info(hwnd) };
+        println!("--------------------------真实窗口--------------------------");
+        unsafe { print_wnd_info(real_foreground_hwnd) };
+        println!("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
+        return;
+    }
+
+    // 1. 获取当前句柄的数值
+    let current_val = hwnd.0 as isize;
+
+    // 2. 检查并更新句柄 (去重逻辑)
+    // swap 方法会将 LAST_HWND 更新为 current_val，并返回旧值
+    let last_val = LAST_HWND.swap(current_val, Ordering::Relaxed);
+
+    // 3. 如果当前句柄 == 上一次句柄，说明是重复事件，直接返回，不打印也不上报
+    if last_val == current_val {
+        print!("与上一次前台窗口一样！");
+        return;
+    }
+    unsafe { print_wnd_info(hwnd) };
 }
 
 fn main() -> Result<()> {
