@@ -136,34 +136,27 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     println!("句柄    : {:?}", hwnd);
 }
 
-unsafe fn handle_foreground_change(hwnd: HWND) {
+unsafe fn handle_foreground_change(_hwnd: HWND) {
 
     // ---------------------------------------------------------------
     // 步骤 1: 瞬态过滤 (防抖)
     // ---------------------------------------------------------------
     // 收到事件后，先休眠 50ms，让 Windows 完成窗口动画和焦点切换的中间状态
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(200));
 
     // 再次获取当前真正的“前台窗口”
     let real_foreground_hwnd = unsafe {
         GetForegroundWindow()    
     };
 
-    // 如果事件通知的窗口 (hwnd) 已经不再是前台窗口了 (real_foreground_hwnd)
-    // 说明这是一个瞬态事件（例如点击最小化按钮时产生的那个瞬间激活信号）
-    // 直接丢弃，不处理
-    if hwnd != real_foreground_hwnd {
-        println!("++++++++++++++++++++++++过滤瞬态窗口++++++++++++++++++++++++");
-        println!("--------------------------上报窗口--------------------------");
-        unsafe { print_wnd_info(hwnd) };
-        println!("--------------------------真实窗口--------------------------");
-        unsafe { print_wnd_info(real_foreground_hwnd) };
-        println!("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
+    // 3. 安全检查：如果获取不到句柄（比如锁屏时），直接退出
+    if real_foreground_hwnd.0 as isize == 0 {
+        print!("窗口句柄为空!");
         return;
-    }
+    }    
 
     // 1. 获取当前句柄的数值
-    let current_val = hwnd.0 as isize;
+    let current_val = real_foreground_hwnd.0 as isize;
 
     // 2. 检查并更新句柄 (去重逻辑)
     // swap 方法会将 LAST_HWND 更新为 current_val，并返回旧值
@@ -174,7 +167,7 @@ unsafe fn handle_foreground_change(hwnd: HWND) {
         print!("与上一次前台窗口一样！");
         return;
     }
-    unsafe { print_wnd_info(hwnd) };
+    unsafe { print_wnd_info(real_foreground_hwnd) };
 }
 
 fn main() -> Result<()> {
