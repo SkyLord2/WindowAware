@@ -10,7 +10,7 @@ use windows::{
     Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
     Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, 
-        GetClassNameW, TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
+        GetClassNameW, TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, WINEVENT_OUTOFCONTEXT,
         GetForegroundWindow,
     },
     // 引入进程线程相关的 API
@@ -91,6 +91,10 @@ unsafe extern "system" fn win_event_proc(
     if event == EVENT_SYSTEM_FOREGROUND {
         unsafe { handle_foreground_change(hwnd) };
     }
+    if event == EVENT_SYSTEM_MINIMIZEEND {
+        println!("Minimize end event detected!");
+        unsafe { handle_foreground_change(hwnd) };
+    }
 }
 
 unsafe fn print_wnd_info(hwnd: HWND) {
@@ -128,12 +132,12 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     let local_now = Local::now();
     let formatted = local_now.format("%Y-%m-%d %H:%M:%S").to_string();
     println!("--------------------------{}------------------------", formatted);
-    println!("检测到窗口切换!");
-    println!("程序名称: {}", process_name); // 例如: chrome.exe
-    println!("窗口标题: {}", title);
-    println!("窗口类名: {}", class_name);
-    println!("进程 ID : {}", process_id);
-    println!("句柄    : {:?}", hwnd);
+    println!("Detected window switch!");
+    println!("Process name: {}", process_name); // 例如: chrome.exe
+    println!("Window title: {}", title);
+    println!("Window class name: {}", class_name);
+    println!("Process ID: {}", process_id);
+    println!("Handle: {:?}", hwnd);
 }
 
 unsafe fn handle_foreground_change(_hwnd: HWND) {
@@ -142,7 +146,7 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
     // 步骤 1: 瞬态过滤 (防抖)
     // ---------------------------------------------------------------
     // 收到事件后，先休眠 50ms，让 Windows 完成窗口动画和焦点切换的中间状态
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
 
     // 再次获取当前真正的“前台窗口”
     let real_foreground_hwnd = unsafe {
@@ -151,9 +155,9 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
 
     // 3. 安全检查：如果获取不到句柄（比如锁屏时），直接退出
     if real_foreground_hwnd.0 as isize == 0 {
-        print!("窗口句柄为空!");
+        println!("The window handle is empty!");
         return;
-    }    
+    }
 
     // 1. 获取当前句柄的数值
     let current_val = real_foreground_hwnd.0 as isize;
@@ -164,19 +168,19 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
 
     // 3. 如果当前句柄 == 上一次句柄，说明是重复事件，直接返回，不打印也不上报
     if last_val == current_val {
-        print!("与上一次前台窗口一样！");
+        println!("It's the same as the previous foreground window handle: {:?}", real_foreground_hwnd);
         return;
     }
     unsafe { print_wnd_info(real_foreground_hwnd) };
 }
 
 fn main() -> Result<()> {
-    println!("正在启动窗口监控 (含进程名)... (按 Ctrl+C 退出)");
+    println!("Starting window monitoring (with process name)... (Press Ctrl+C to exit)");
 
     unsafe {
         let hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_MINIMIZEEND,
             None,
             Some(win_event_proc),
             0,
@@ -185,7 +189,7 @@ fn main() -> Result<()> {
         );
 
         if hook.is_invalid() {
-            eprintln!("设置钩子失败！");
+            eprintln!("Failed to set hook!");
             return Ok(());
         }
 
