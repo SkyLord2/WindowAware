@@ -28,14 +28,12 @@ struct SwitchEvent {
 }
 
 struct WindowStats {
-    first_seen: DateTime<Local>, // 第一次检测到该窗口的时间
-    total_count: usize,          // 当天总切换次数
+    first_seen: DateTime<Local>,
+    total_count: usize,
 }
 
 struct MonitorState {
-    // 历史队列：保存最近 5 分钟的所有切换记录
     history: VecDeque<SwitchEvent>,
-    // 每日统计：保存窗口的长期汇总信息
     daily_stats: HashMap<isize, WindowStats>, 
 }
 
@@ -51,11 +49,8 @@ impl MonitorState {
 
     fn add_event(&mut self, hwnd: isize) {
         let now = Local::now();
-        
-        // 1. 更新滑动窗口历史记录 (用于短期 5 分钟分析)
         self.history.push_back(SwitchEvent { hwnd, timestamp: now });
         
-        // 清理超过 5 分钟的数据
         while let Some(front) = self.history.front() {
             if now.signed_duration_since(front.timestamp).num_minutes() >= Self::HISTORY_LIMIT_MINUTES {
                 self.history.pop_front();
@@ -64,7 +59,6 @@ impl MonitorState {
             }
         }
 
-        // 2. 更新长期统计数据 (用于当天平均分析)
         self.daily_stats.entry(hwnd)
             .and_modify(|stats| stats.total_count += 1)
             .or_insert(WindowStats {
@@ -73,15 +67,16 @@ impl MonitorState {
             });
     }
 
-    // 规则 1: 实时感知 (60秒内 A-B-A-B 震荡)
-    fn check_oscillation(&self, current_hwnd: isize) -> bool {
+    // [MODIFIED] 规则 1: 实时感知 (60秒内 A-B-A-B 震荡)
+    // 修改返回值：如果有震荡，返回 Some((hwnd_A, hwnd_B))，否则返回 None
+    fn check_oscillation(&self, current_hwnd: isize) -> Option<(isize, isize)> {
         let now = Local::now();
         let recent_events: Vec<&SwitchEvent> = self.history.iter()
             .rev()
             .take_while(|e| now.signed_duration_since(e.timestamp).num_seconds() <= 60)
             .collect();
 
-        if recent_events.len() < 5 { return false; }
+        if recent_events.len() < 5 { return None; }
 
         let event_a1 = recent_events[0];
         let event_b1 = recent_events[1];
@@ -95,26 +90,20 @@ impl MonitorState {
            && event_b1.hwnd == event_b2.hwnd
            && event_a1.hwnd != event_b1.hwnd 
         {
-             return true;
+             // 返回 A 和 B 的句柄
+             return Some((event_a1.hwnd, event_b1.hwnd));
         }
-        false
+        None
     }
 
-    // [NEW] 规则 2: 短期分析 (5分钟内滑动平均频率)
-    // 计算公式：最近5分钟内的出现次数 / 有效监控时长(max 5min)
     fn get_short_term_average(&self, hwnd: isize) -> f64 {
-        // 1. 统计历史队列中该窗口出现的次数 (history 已经被限制在5分钟内)
         let count_in_window = self.history.iter().filter(|e| e.hwnd == hwnd).count();
         
-        // 2. 计算分母（时间窗口）
         if let Some(stats) = self.daily_stats.get(&hwnd) {
             let now = Local::now();
             let duration_since_start = now.signed_duration_since(stats.first_seen).num_seconds() as f64 / 60.0;
-            
-            // 如果窗口出现时间 < 5分钟，用实际时长作为分母；否则用 5.0
             let effective_window = if duration_since_start > 5.0 { 5.0 } else { duration_since_start };
 
-            // 过滤噪音：如果监控时长不足 30 秒，数据不稳定，暂不返回高频结果
             if effective_window < 0.5 { return 0.0; }
 
             return count_in_window as f64 / effective_window;
@@ -122,13 +111,12 @@ impl MonitorState {
         0.0
     }
 
-    // 规则 3: 长期学习 (当天平均切换频率)
     fn get_daily_average(&self, hwnd: isize) -> f64 {
         if let Some(stats) = self.daily_stats.get(&hwnd) {
             let now = Local::now();
             let duration_minutes = now.signed_duration_since(stats.first_seen).num_seconds() as f64 / 60.0;
             
-            if duration_minutes < 1.0 { return 0.0; } // 不足1分钟忽略
+            if duration_minutes < 1.0 { return 0.0; }
             return stats.total_count as f64 / duration_minutes;
         }
         0.0
@@ -162,6 +150,23 @@ unsafe fn get_process_name(process_id: u32) -> String {
     Path::new(&full_path).file_name().and_then(|name| name.to_str()).unwrap_or(&full_path).to_string()
 }
 
+// [NEW] 获取任意窗口的详细信息（用于震荡告警时反查 B 窗口信息）
+unsafe fn get_window_details(hwnd_val: isize) -> String {
+    let hwnd = HWND(hwnd_val as *mut _);
+    
+    // 1. 获取标题
+    let mut buffer = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+    let title = if len > 0 { String::from_utf16_lossy(&buffer[..len as usize]) } else { String::from("No Title") };
+
+    // 2. 获取进程名
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let process_name = unsafe { get_process_name(process_id) };
+
+    format!("[{}] (PID: {}) - {}", process_name, process_id, title)
+}
+
 // =============================================================================
 // 核心逻辑
 // =============================================================================
@@ -170,30 +175,37 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
     let state_lock = GLOBAL_STATE.get_or_init(|| Mutex::new(MonitorState::new()));
     
     if let Ok(mut state) = state_lock.lock() {
-        // 1. 记录数据
         state.add_event(hwnd_val);
 
         // 获取各项指标
-        let is_oscillating = state.check_oscillation(hwnd_val);
-        let short_term_avg = state.get_short_term_average(hwnd_val); // 5分钟均值
-        let daily_avg = state.get_daily_average(hwnd_val);           // 全天均值
+        // [MODIFIED] 现在 check_oscillation 返回 Option<(A, B)>
+        let oscillation_pair = state.check_oscillation(hwnd_val);
+        
+        let short_term_avg = state.get_short_term_average(hwnd_val);
+        let daily_avg = state.get_daily_average(hwnd_val);
 
         // =======================
         // 触发规则逻辑
         // =======================
 
         // 1) 实时感知: 震荡检测
-        if is_oscillating {
+        if let Some((hwnd_a, hwnd_b)) = oscillation_pair {
+            // 获取 A 和 B 的详细信息
+            // 注意：这里需要 unsafe 块来调用 Win32 API
+            let info_a = unsafe { get_window_details(hwnd_a) };
+            let info_b = unsafe { get_window_details(hwnd_b) };
+
             println!(">>> [ALERT] Oscillation Detected! Rapid switching (A-B-A-B) in 60s.");
+            println!("    Window A: {}", info_a);
+            println!("    Window B: {}", info_b);
         }
 
-        // 2) 长期学习: 全天频率 > 60 (你指定的阈值)
-        // 注意：这是一个非常高的阈值
-        if daily_avg > 60.0 {
+        // 2) 长期学习
+        if daily_avg > 20.0 {
             println!(">>> [CRITICAL] Daily Limit Exceeded for [{}]: {:.1} avg/min (Threshold: 60.0)", process_name, daily_avg);
         }
-        // 3) 短期分析: 5分钟内 > 15 (你指定的阈值)
-        else if short_term_avg > 15.0 {
+        // 3) 短期分析
+        else if short_term_avg > 5.0 {
             println!(">>> [WARN] Short-term Burst for [{}]: {:.1} avg/min (Last 5 mins > 15.0)", process_name, short_term_avg);
         }
     }
@@ -217,9 +229,8 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     println!("--------------------------{}------------------------", formatted);
     println!("Process: {} | PID: {}", process_name, process_id);
     println!("Title:   {}", title);
-    println!("Class: {}", class_name);
+    println!("Class:   {}", class_name);
     
-    // 调用分析逻辑
     analyze_behavior(hwnd.0 as isize, &process_name);
 }
 
@@ -249,7 +260,7 @@ unsafe extern "system" fn win_event_proc(
 
 fn main() -> Result<()> {
     println!("Starting Smart Window Monitor...");
-    println!("Updated Rules:");
+    println!("Rules applied:");
     println!("  1. Real-time:  Oscillation A-B-A-B >= 4 times (60s)");
     println!("  2. Short-term: Avg > 15 switches/min (Window: 5 mins)");
     println!("  3. Daily:      Avg > 60 switches/min (Window: All day)");
