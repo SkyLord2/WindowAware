@@ -1,8 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use chrono::{Local};
-use std::thread;
-use std::time::Duration;
 // 用于处理文件路径
 use windows::{
     core::*,
@@ -11,7 +9,6 @@ use windows::{
     Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, 
         GetClassNameW, TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, WINEVENT_OUTOFCONTEXT,
-        GetForegroundWindow,
     },
     // 引入进程线程相关的 API
     Win32::System::Threading::{
@@ -146,21 +143,21 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
     // 步骤 1: 瞬态过滤 (防抖)
     // ---------------------------------------------------------------
     // 收到事件后，先休眠 50ms，让 Windows 完成窗口动画和焦点切换的中间状态
-    thread::sleep(Duration::from_millis(100));
+    // thread::sleep(Duration::from_millis(100));
 
     // 再次获取当前真正的“前台窗口”
-    let real_foreground_hwnd = unsafe {
-        GetForegroundWindow()    
-    };
+    // let real_foreground_hwnd = unsafe {
+    //     GetForegroundWindow()    
+    // };
 
     // 3. 安全检查：如果获取不到句柄（比如锁屏时），直接退出
-    if real_foreground_hwnd.0 as isize == 0 {
+    if _hwnd.0 as isize == 0 {
         println!("The window handle is empty!");
         return;
     }
 
     // 1. 获取当前句柄的数值
-    let current_val = real_foreground_hwnd.0 as isize;
+    let current_val = _hwnd.0 as isize;
 
     // 2. 检查并更新句柄 (去重逻辑)
     // swap 方法会将 LAST_HWND 更新为 current_val，并返回旧值
@@ -168,10 +165,10 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
 
     // 3. 如果当前句柄 == 上一次句柄，说明是重复事件，直接返回，不打印也不上报
     if last_val == current_val {
-        println!("It's the same as the previous foreground window handle: {:?}", real_foreground_hwnd);
+        println!("It's the same as the previous foreground window handle: {:?}", _hwnd);
         return;
     }
-    unsafe { print_wnd_info(real_foreground_hwnd) };
+    unsafe { print_wnd_info(_hwnd) };
 }
 
 fn main() -> Result<()> {
