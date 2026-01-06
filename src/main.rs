@@ -30,26 +30,55 @@ struct SwitchEvent {
 struct WindowStats {
     first_seen: DateTime<Local>,
     // total_count 在滑动窗口模式下不再需要累积，我们通过实时计算 history 队列得出
+    // [NEW] 记录该窗口累计在前台的总时长 (毫秒)
+    total_duration_ms: i64, 
 }
 
 struct MonitorState {
     history: VecDeque<SwitchEvent>,
     daily_stats: HashMap<isize, WindowStats>, 
+    // [NEW] 记录上一次切换发生的时间，用于计算停留时长
+    last_switch_time: Option<DateTime<Local>>,
+    // [NEW] 记录上一个处于前台的窗口句柄
+    last_active_hwnd: Option<isize>,
 }
 
 impl MonitorState {
-    // [MODIFIED] 历史记录必须保留 24 小时 (1440 分钟)，原本是 5 分钟
+    // 历史记录必须保留 24 小时 (1440 分钟)，原本是 5 分钟
     const HISTORY_LIMIT_MINUTES: i64 = 24 * 60;
 
     fn new() -> Self {
         Self {
             history: VecDeque::new(),
             daily_stats: HashMap::new(),
+            // [NEW] 初始化为空
+            last_switch_time: None,
+            last_active_hwnd: None,
         }
     }
 
     fn add_event(&mut self, hwnd: isize) {
         let now = Local::now();
+
+        // [NEW] 计算并更新 **上一个** 窗口的停留时长
+        // 逻辑：当前时间 - 上次切换时间 = 上一个窗口在前台停留的时间
+        if let Some(last_time) = self.last_switch_time {
+            if let Some(last_hwnd) = self.last_active_hwnd {
+                let duration = now.signed_duration_since(last_time).num_milliseconds();
+                
+                // 更新上一个窗口的统计信息
+                self.daily_stats.entry(last_hwnd)
+                    .and_modify(|stats| stats.total_duration_ms += duration)
+                    .or_insert(WindowStats {
+                        first_seen: last_time,
+                        total_duration_ms: duration,
+                    });
+            }
+        }
+
+        // [NEW] 更新状态，将当前窗口标记为活跃窗口，并记录开始时间
+        self.last_switch_time = Some(now);
+        self.last_active_hwnd = Some(hwnd);
         
         // 1. 添加新事件
         self.history.push_back(SwitchEvent { hwnd, timestamp: now });
@@ -64,9 +93,11 @@ impl MonitorState {
         }
 
         // 3. 记录首次出现时间 (用于计算分母)
+        // 注意：如果是新窗口，total_duration_ms 初始化为 0，因为它是刚切进来的
         self.daily_stats.entry(hwnd)
             .or_insert(WindowStats {
                 first_seen: now,
+                total_duration_ms: 0, 
             });
     }
 
@@ -130,14 +161,19 @@ impl MonitorState {
         count as f64 / duration_min
     }
 
-    // [MODIFIED] 获取从当前时间往前 5 分钟的时间范围内，窗口的每分钟切换频率
+    // 获取从当前时间往前 5 分钟的时间范围内，窗口的每分钟切换频率
     fn get_short_term_average(&self, hwnd: isize) -> f64 {
         self.calculate_frequency(hwnd, 5)
     }
 
-    // [MODIFIED] 获取从当前时间往前 24 小时的时间范围内，窗口的每分钟切换频率
+    // 获取从当前时间往前 24 小时的时间范围内，窗口的每分钟切换频率
     fn get_daily_average(&self, hwnd: isize) -> f64 {
         self.calculate_frequency(hwnd, 24 * 60)
+    }
+
+    // [NEW] 获取指定窗口的总前台时长 (ms)
+    fn get_total_duration(&self, hwnd: isize) -> i64 {
+        self.daily_stats.get(&hwnd).map(|s| s.total_duration_ms).unwrap_or(0)
     }
 }
 
@@ -196,6 +232,8 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
         
         let short_term_avg = state.get_short_term_average(hwnd_val);
         let daily_avg = state.get_daily_average(hwnd_val);
+        // [NEW] 获取总时长
+        let total_duration = state.get_total_duration(hwnd_val);
 
         // =======================
         // 触发规则逻辑
@@ -221,7 +259,9 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
         }
 
         // Debug 输出
-        println!("Process: {}, Daily Avg (24h): {:.2}, Short Term Avg (5m): {:.2}", process_name, daily_avg, short_term_avg);
+        // [NEW] 在日志中增加 Duration 输出
+        println!("Process: {}, Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
+            process_name, daily_avg, short_term_avg, total_duration);
     }
 }
 
