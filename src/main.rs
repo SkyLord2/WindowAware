@@ -1,4 +1,4 @@
-use std::collections::{VecDeque, HashMap};
+use std::collections::{VecDeque, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -29,17 +29,16 @@ struct SwitchEvent {
 
 struct WindowStats {
     first_seen: DateTime<Local>,
-    // total_count 在滑动窗口模式下不再需要累积，我们通过实时计算 history 队列得出
-    // [NEW] 记录该窗口累计在前台的总时长 (毫秒)
+    // 记录该窗口累计在前台的总时长 (毫秒)
     total_duration_ms: i64, 
 }
 
 struct MonitorState {
     history: VecDeque<SwitchEvent>,
     daily_stats: HashMap<isize, WindowStats>, 
-    // [NEW] 记录上一次切换发生的时间，用于计算停留时长
+    // 记录上一次切换发生的时间，用于计算停留时长
     last_switch_time: Option<DateTime<Local>>,
-    // [NEW] 记录上一个处于前台的窗口句柄
+    // 记录上一个处于前台的窗口句柄
     last_active_hwnd: Option<isize>,
 }
 
@@ -51,7 +50,7 @@ impl MonitorState {
         Self {
             history: VecDeque::new(),
             daily_stats: HashMap::new(),
-            // [NEW] 初始化为空
+            // 初始化为空
             last_switch_time: None,
             last_active_hwnd: None,
         }
@@ -60,7 +59,7 @@ impl MonitorState {
     fn add_event(&mut self, hwnd: isize) {
         let now = Local::now();
 
-        // [NEW] 计算并更新 **上一个** 窗口的停留时长
+        // 计算并更新 **上一个** 窗口的停留时长
         // 逻辑：当前时间 - 上次切换时间 = 上一个窗口在前台停留的时间
         if let Some(last_time) = self.last_switch_time {
             if let Some(last_hwnd) = self.last_active_hwnd {
@@ -76,7 +75,7 @@ impl MonitorState {
             }
         }
 
-        // [NEW] 更新状态，将当前窗口标记为活跃窗口，并记录开始时间
+        // 更新状态，将当前窗口标记为活跃窗口，并记录开始时间
         self.last_switch_time = Some(now);
         self.last_active_hwnd = Some(hwnd);
         
@@ -129,6 +128,39 @@ impl MonitorState {
         None
     }
 
+    // 模式识别：判断当前是震荡模式 (A-B) 还是随机模式 (A-C-B-D)
+    fn identify_pattern(&self, current_hwnd: isize) -> String {
+        // 1. 优先检测震荡 (Strict Oscillation)
+        if self.check_oscillation(current_hwnd).is_some() {
+            return String::from("Oscillation (A-B-A-B)");
+        }
+
+        // 2. 检测随机模式 (Random / Multitasking)
+        // 逻辑：取最近的 10 次切换记录，如果其中包含了 3 个或以上的唯一窗口，则认为是随机多任务模式
+        let check_depth = 10;
+        let recent_events: Vec<isize> = self.history.iter()
+            .rev()
+            .take(check_depth)
+            .map(|e| e.hwnd)
+            .collect();
+
+        // 如果数据不足，无法判断
+        if recent_events.len() < 3 {
+            return String::from("Gathering Data...");
+        }
+
+        // 使用 HashSet 统计唯一窗口数
+        let unique_count = recent_events.iter().collect::<HashSet<_>>().len();
+
+        if unique_count >= 3 {
+            return String::from("Random (Multitasking)");
+        } else if unique_count == 2 {
+            return String::from("Oscillation (A-B-A-B)");
+        } else {
+            return String::from("Focused (Single Window)");
+        }
+    }
+
     // 辅助计算频率的通用函数
     // limit_minutes: 统计的时间窗口大小（例如 5 或 1440）
     fn calculate_frequency(&self, hwnd: isize, limit_minutes: i64) -> f64 {
@@ -171,7 +203,7 @@ impl MonitorState {
         self.calculate_frequency(hwnd, 24 * 60)
     }
 
-    // [NEW] 获取指定窗口的总前台时长 (ms)
+    // 获取指定窗口的总前台时长 (ms)
     fn get_total_duration(&self, hwnd: isize) -> i64 {
         self.daily_stats.get(&hwnd).map(|s| s.total_duration_ms).unwrap_or(0)
     }
@@ -232,8 +264,10 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
         
         let short_term_avg = state.get_short_term_average(hwnd_val);
         let daily_avg = state.get_daily_average(hwnd_val);
-        // [NEW] 获取总时长
+        // 获取总时长
         let total_duration = state.get_total_duration(hwnd_val);
+        // 获取当前模式
+        let pattern_type = state.identify_pattern(hwnd_val);
 
         // =======================
         // 触发规则逻辑
@@ -259,9 +293,9 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
         }
 
         // Debug 输出
-        // [NEW] 在日志中增加 Duration 输出
-        println!("Process: {}, Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
-            process_name, daily_avg, short_term_avg, total_duration);
+        // 在日志中增加 Pattern 输出
+        println!("Process: {}, Pattern: [{}], Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
+            process_name, pattern_type, daily_avg, short_term_avg, total_duration);
     }
 }
 
