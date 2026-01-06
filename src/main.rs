@@ -2,19 +2,25 @@ use std::collections::{VecDeque, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, Duration}; // [NEW] 引入时间处理
 use chrono::{DateTime, Local};
 
 use windows::{
     core::*,
-    Win32::Foundation::{HWND, CloseHandle},
+    Win32::Foundation::{HWND, CloseHandle, LPARAM, WPARAM, LRESULT, HINSTANCE},
     Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
+    // 引入钩子相关的 API
     Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, 
         GetClassNameW, TranslateMessage, MSG, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, WINEVENT_OUTOFCONTEXT,
+        SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, 
+        KBDLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_SYSKEYDOWN, HC_ACTION,
     },
+    Win32::UI::Input::KeyboardAndMouse::{VK_TAB},
     Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32
     },
+    Win32::System::LibraryLoader::GetModuleHandleW,
 };
 
 // =============================================================================
@@ -212,9 +218,54 @@ impl MonitorState {
 static GLOBAL_STATE: OnceLock<Mutex<MonitorState>> = OnceLock::new();
 static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
 
+// [NEW] 用于记录最后一次检测到的输入源及其发生时间
+// (输入源描述, 发生时的Instant)
+static LAST_INPUT_EVENT: OnceLock<Mutex<(String, Instant)>> = OnceLock::new();
+
 // =============================================================================
-// 辅助函数
+// 钩子回调与辅助函数
 // =============================================================================
+
+// [MODIFIED] 键盘钩子：监听 Alt+Tab 和 其他按键
+unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code == HC_ACTION as i32 {
+        let w_param_u32 = w_param.0 as u32;
+        
+        // 修复：解引用裸指针需要 unsafe 块
+        let vk_code = unsafe { (*(l_param.0 as *const KBDLLHOOKSTRUCT)).vkCode as u16 };
+
+        // WM_SYSKEYDOWN 专门捕获 Alt 组合键 (例如 Alt+Tab)
+        if w_param_u32 == WM_SYSKEYDOWN {
+            if vk_code == VK_TAB.0 {
+                // 更新全局状态：检测到 Alt+Tab
+                if let Some(mutex) = LAST_INPUT_EVENT.get() {
+                    if let Ok(mut data) = mutex.lock() {
+                        *data = (String::from("Keyboard (Alt+Tab)"), Instant::now());
+                    }
+                }
+            }
+        }
+        // 如果需要检测 Win+Tab，可以监听 VK_LWIN/VK_RWIN + Tab，但这通常是 OS 级切换，Win32 API 较难精准捕获前台变化
+    }
+    // 修复：调用 unsafe 函数需要 unsafe 块
+    unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
+}
+
+// [MODIFIED] 鼠标钩子：监听左键点击
+unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code == HC_ACTION as i32 {
+        // 如果检测到左键按下
+        if w_param.0 as u32 == WM_LBUTTONDOWN {
+             if let Some(mutex) = LAST_INPUT_EVENT.get() {
+                if let Ok(mut data) = mutex.lock() {
+                    *data = (String::from("Mouse Click"), Instant::now());
+                }
+            }
+        }
+    }
+    // 修复：调用 unsafe 函数需要 unsafe 块
+    unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
+}
 
 unsafe fn get_process_name(process_id: u32) -> String {
     let handle_result = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) };
@@ -254,7 +305,7 @@ unsafe fn get_window_details(hwnd_val: isize) -> String {
 // 核心逻辑
 // =============================================================================
 
-fn analyze_behavior(hwnd_val: isize, process_name: &str) {
+fn analyze_behavior(hwnd_val: isize, process_name: &str, input_source: &str) {
     let state_lock = GLOBAL_STATE.get_or_init(|| Mutex::new(MonitorState::new()));
     
     if let Ok(mut state) = state_lock.lock() {
@@ -293,9 +344,10 @@ fn analyze_behavior(hwnd_val: isize, process_name: &str) {
         }
 
         // Debug 输出
-        // 在日志中增加 Pattern 输出
-        println!("Process: {}, Pattern: [{}], Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
-            process_name, pattern_type, daily_avg, short_term_avg, total_duration);
+        // 在日志中增加 Pattern 和 Input Source 输出
+        // [NEW] 增加了 Source 字段
+        println!("Process: {}, Source: [{}], Pattern: [{}], Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
+            process_name, input_source, pattern_type, daily_avg, short_term_avg, total_duration);
     }
 }
 
@@ -312,6 +364,19 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     let process_name = unsafe { get_process_name(process_id) };
 
+    // [NEW] 获取钩子记录的最后一次输入源，并检查时间有效性
+    let mut input_source = String::from("Keyboard (Shortcut/Other)");
+    if let Some(mutex) = LAST_INPUT_EVENT.get() {
+        if let Ok(data) = mutex.lock() {
+            let (source, time) = &*data;
+            // 只有当输入事件发生在最近 1000ms 内，才认为是由于该输入导致的切换
+            // 否则可能是系统自动弹窗，或者上一次记录已经过时
+            if time.elapsed() < Duration::from_millis(1000) {
+                input_source = source.clone();
+            }
+        }
+    }
+
     let local_now = Local::now();
     let formatted = local_now.format("%Y-%m-%d %H:%M:%S").to_string();
     println!("--------------------------{}------------------------", formatted);
@@ -319,7 +384,8 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     println!("Title:   {}", title);
     println!("Class:   {}", class_name);
     
-    analyze_behavior(hwnd.0 as isize, &process_name);
+    // 传入输入源信息
+    analyze_behavior(hwnd.0 as isize, &process_name, &input_source);
 }
 
 unsafe fn handle_foreground_change(_hwnd: HWND) {
@@ -328,6 +394,8 @@ unsafe fn handle_foreground_change(_hwnd: HWND) {
     let current_val = _hwnd.0 as isize;
     let last_val = LAST_HWND.swap(current_val, Ordering::Relaxed);
     if last_val == current_val { return; }
+
+    // 这里不需要 detect_input_source 了，因为逻辑已经移到了 Hook 回调和 print_wnd_info 中
 
     unsafe { print_wnd_info(_hwnd) };
 }
@@ -347,14 +415,33 @@ unsafe extern "system" fn win_event_proc(
 }
 
 fn main() -> Result<()> {
+    // [NEW] 初始化全局输入记录器，默认时间设为很久以前，避免启动误判
+    LAST_INPUT_EVENT.get_or_init(|| Mutex::new((String::from("Ready"), Instant::now() - Duration::from_secs(100))));
+
     println!("Starting Smart Window Monitor...");
     println!("Rules applied:");
     println!("  1. Real-time:  Oscillation A-B-A-B >= 4 times (60s)");
     println!("  2. Short-term: Avg > 15 switches/min (Window: Last 5 mins)");
     println!("  3. Daily:      Avg > 20 switches/min (Window: Last 24 hours)");
+    println!("  4. Input:      Accurate Alt+Tab vs Mouse Click detection via Hooks");
     println!("(Press Ctrl+C to exit)\n");
 
     unsafe {
+        // [NEW] 安装键盘和鼠标钩子
+        // 修复：类型转换错误 (HMODULE -> HINSTANCE)
+        // GetModuleHandleW 返回 HMODULE，SetWindowsHookExW 需要 Option<HINSTANCE>
+        // 在 Windows API 中，HINSTANCE 和 HMODULE 通常是兼容的，可以通过值转换
+        let module_handle = GetModuleHandleW(None).unwrap_or_default();
+        let h_instance = HINSTANCE(module_handle.0); // 转换
+        
+        // WH_KEYBOARD_LL 和 WH_MOUSE_LL 是低级全局钩子，不需要注入 DLL
+        let kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(h_instance), 0);
+        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(h_instance), 0);
+
+        if kbd_hook.is_err() || mouse_hook.is_err() {
+            eprintln!("Warning: Failed to install input hooks. Input detection might not work.");
+        }
+
         let hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_MINIMIZEEND,
@@ -366,7 +453,7 @@ fn main() -> Result<()> {
         );
 
         if hook.is_invalid() {
-            eprintln!("Failed to set hook!");
+            eprintln!("Failed to set win event hook!");
             return Ok(());
         }
 
@@ -375,6 +462,10 @@ fn main() -> Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        // 退出前清理钩子
+        if let Ok(h) = kbd_hook { let _ = UnhookWindowsHookEx(h); }
+        if let Ok(h) = mouse_hook { let _ = UnhookWindowsHookEx(h); }
     }
     Ok(())
 }
