@@ -21,7 +21,7 @@ use crate::analysis::analyze_behavior;
 // 钩子回调与辅助函数
 // =============================================================================
 
-// [MODIFIED] 键盘钩子：监听 Alt+Tab 和 其他按键
+// 键盘钩子：监听 Alt+Tab 和 其他按键
 pub unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code == HC_ACTION as i32 {
         let w_param_u32 = w_param.0 as u32;
@@ -45,7 +45,7 @@ pub unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l
     unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
 }
 
-// [MODIFIED] 鼠标钩子：监听左键点击
+// 鼠标钩子：监听左键点击
 pub unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code == HC_ACTION as i32 {
         // 如果检测到左键按下
@@ -74,7 +74,12 @@ unsafe fn print_wnd_info(hwnd: HWND) {
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     let process_name = unsafe { get_process_name(process_id) };
 
-    // [NEW] 获取钩子记录的最后一次输入源，并检查时间有效性
+    // 过滤逻辑：忽略没有标题的窗口 或 任务栏(Shell_TrayWnd)
+    if title == "No Title" || class_name == "Shell_TrayWnd" {
+        return;
+    }
+
+    // 获取钩子记录的最后一次输入源，并检查时间有效性
     let mut input_source = String::from("Keyboard (Shortcut/Other)");
     if let Some(mutex) = LAST_INPUT_EVENT.get() {
         if let Ok(data) = mutex.lock() {

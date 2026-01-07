@@ -22,7 +22,7 @@ use crate::global::LAST_INPUT_EVENT;
 use crate::hooks::{keyboard_hook_proc, mouse_hook_proc, win_event_proc};
 
 fn main() -> Result<()> {
-    // [NEW] 初始化全局输入记录器，默认时间设为很久以前，避免启动误判
+    // 初始化全局输入记录器，默认时间设为很久以前，避免启动误判
     LAST_INPUT_EVENT.get_or_init(|| Mutex::new((String::from("Ready"), Instant::now() - Duration::from_secs(100))));
 
     println!("Starting Smart Window Monitor...");
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     println!("(Press Ctrl+C to exit)\n");
 
     unsafe {
-        // [NEW] 安装键盘和鼠标钩子
+        // 安装键盘和鼠标钩子
         // 修复：类型转换错误 (HMODULE -> HINSTANCE)
         // GetModuleHandleW 返回 HMODULE，SetWindowsHookExW 需要 Option<HINSTANCE>
         // 在 Windows API 中，HINSTANCE 和 HMODULE 通常是兼容的，可以通过值转换

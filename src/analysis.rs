@@ -47,7 +47,7 @@ pub fn analyze_behavior(hwnd_val: isize, process_name: &str, input_source: &str)
 
         // Debug 输出
         // 在日志中增加 Pattern 和 Input Source 输出
-        // [NEW] 增加了 Source 字段
+        // 增加了 Source 字段
         println!("Process: {}, Source: [{}], Pattern: [{}], Daily Avg: {:.2}, Short Avg: {:.2}, Total Time: {} ms", 
             process_name, input_source, pattern_type, daily_avg, short_term_avg, total_duration);
     }
